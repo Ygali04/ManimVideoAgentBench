@@ -29,7 +29,7 @@ class VideoRenderer:
         self.print_response = print_response
         self.use_visual_fix_code = use_visual_fix_code
 
-    async def render_scene(self, code: str, file_prefix: str, curr_scene: int, curr_version: int, code_dir: str, media_dir: str, max_retries: int = 3, use_visual_fix_code=False, visual_self_reflection_func=None, banned_reasonings=None, scene_trace_id=None, topic=None, session_id=None):
+    async def render_scene(self, code: str, file_prefix: str, curr_scene: int, curr_version: int, code_dir: str, media_dir: str, max_retries: int = 3, use_visual_fix_code=False, visual_self_reflection_func=None, banned_reasonings=None, scene_trace_id=None, topic=None, session_id=None, scene_model_name: Optional[str] = None):
         """Render a single scene and handle error retries and visual fixes.
 
         Args:
@@ -51,7 +51,10 @@ class VideoRenderer:
             tuple: (code, error_message) where error_message is None on success
         """
         retries = 0
-        while retries < max_retries:
+        # Ensure we always attempt at least one render, even if max_retries == 0
+        # (notes/eval.md defines N=0 as “no fix loop”, not “skip rendering”.)
+        render_attempts = max(1, max_retries)
+        while retries < render_attempts:
             try:
                 # Execute manim in a thread to prevent blocking
                 file_path = os.path.join(code_dir, f"{file_prefix}_scene{curr_scene}_v{curr_version}.py")
@@ -75,8 +78,9 @@ class VideoRenderer:
                         f"{file_prefix}_scene{curr_scene}_v{curr_version}.mp4"
                     )
                     
-                    # For Gemini/Vertex AI models, pass the video directly
-                    if self.scene_model.model_name.startswith(('gemini/', 'vertex_ai/')):
+                    # For Gemini/Vertex AI models, pass the video directly (they can ingest local video files).
+                    # For other models, we pass an image snapshot to avoid attempting to open an .mp4 as an image.
+                    if scene_model_name and scene_model_name.startswith(('gemini/', 'vertex_ai/')):
                         media_input = video_path
                     else:
                         # For other models, use image snapshot
@@ -234,7 +238,12 @@ class VideoRenderer:
             return
         with open(scene_outline_path) as f:
             plan = f.read()
-        scene_outline = re.search(r'(<SCENE_OUTLINE>.*?</SCENE_OUTLINE>)', plan, re.DOTALL).group(1)
+        scene_outline_match = re.search(r'(<SCENE_OUTLINE>.*?</SCENE_OUTLINE>)', plan, re.DOTALL)
+        if not scene_outline_match:
+            print(f"Warning: No valid <SCENE_OUTLINE> tags found in {scene_outline_path}. Cannot combine videos.")
+            print(f"File content preview: {plan[:500] if plan else '(empty)'}")
+            return
+        scene_outline = scene_outline_match.group(1)
         scene_count = len(re.findall(r'<SCENE_(\d+)>[^<]', scene_outline))
 
         # Find all scene folders and videos

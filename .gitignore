@@ -2,3 +2,8 @@
 
 .env
 *.zip
+.venv/*
+data/rag/*
+output/*
+models/*.onnx
+models/*.bin

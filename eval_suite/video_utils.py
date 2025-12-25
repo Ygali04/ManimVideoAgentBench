@@ -1,10 +1,16 @@
 import os
 import cv2
 import tempfile
+import base64
 
 from dotenv import load_dotenv
 
-from mllm_tools.utils import _prepare_text_video_inputs
+from mllm_tools.openrouter_client import (
+    OpenRouterClient,
+    build_user_message,
+    local_video_path_to_part,
+    image_url_part,
+)
 from eval_suite.prompts_raw import _video_eval_new
 from eval_suite.utils import extract_json, convert_score_fields
 
@@ -14,15 +20,15 @@ load_dotenv()
 def reduce_video_framerate(input_path, target_fps=1, output_path=None):
     """
     Reduces the frame rate of a video by only keeping frames at the target interval.
-    
+
     Args:
         input_path (str): Path to the input video
         target_fps (int): Target frames per second (default: 1)
         output_path (str, optional): Path to save the processed video. If None, uses a temporary file.
-    
+
     Returns:
         str: Path to the processed video
-        
+
     Raises:
         ValueError: If input video cannot be opened or has invalid FPS
         RuntimeError: If video writer initialization fails or output video creation fails
@@ -30,25 +36,26 @@ def reduce_video_framerate(input_path, target_fps=1, output_path=None):
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         raise ValueError(f"Could not open input video: {input_path}")
-        
+
     original_fps = cap.get(cv2.CAP_PROP_FPS)
     if original_fps <= 0:
-        raise ValueError(f"Invalid FPS ({original_fps}) detected in input video")
-        
+        raise ValueError(
+            f"Invalid FPS ({original_fps}) detected in input video")
+
     frame_interval = int(original_fps / target_fps)
-    
+
     # Get video properties
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    
+
     # Use provided output path or create temporary file
     if output_path is None:
         temp_output = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
         output_path = temp_output.name
-    
+
     # Ensure output directory exists
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    
+
     # Try different codecs in order of preference
     codecs = [
         ('avc1', '.mp4'),  # H.264 codec
@@ -56,16 +63,16 @@ def reduce_video_framerate(input_path, target_fps=1, output_path=None):
         ('XVID', '.avi'),  # XVID codec
         ('MJPG', '.avi'),  # Motion JPEG codec
     ]
-    
+
     success = False
     for codec, ext in codecs:
         if output_path.endswith('.mp4') and not ext.endswith('.mp4'):
             # If we're switching to AVI format, change the extension
             output_path = output_path[:-4] + ext
-            
+
         fourcc = cv2.VideoWriter_fourcc(*codec)
         out = cv2.VideoWriter(output_path, fourcc, target_fps, (width, height))
-        
+
         if out.isOpened():
             success = True
             print(f"Successfully initialized video writer with codec: {codec}")
@@ -74,48 +81,57 @@ def reduce_video_framerate(input_path, target_fps=1, output_path=None):
             out.release()
             if os.path.exists(output_path):
                 os.remove(output_path)
-    
+
     if not success:
-        raise RuntimeError("Could not initialize video writer with any available codec")
-    
+        raise RuntimeError(
+            "Could not initialize video writer with any available codec")
+
     frame_count = 0
     frames_written = 0
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-            
+
         # Only write frames at the specified interval
         if frame_count % frame_interval == 0:
             out.write(frame)
             frames_written += 1
         frame_count += 1
-    
+
     cap.release()
     out.release()
-    
+
     # Verify the output
     verify_cap = cv2.VideoCapture(output_path)
     if not verify_cap.isOpened():
         raise RuntimeError(f"Failed to create output video at {output_path}")
-        
+
     actual_fps = verify_cap.get(cv2.CAP_PROP_FPS)
     total_frames = verify_cap.get(cv2.CAP_PROP_FRAME_COUNT)
     verify_cap.release()
-    
+
     if actual_fps <= 0:
         print("Warning: Output video reports invalid FPS. This might be a codec issue.")
         actual_fps = target_fps  # Use target FPS for duration calculation
-    
+
     print(f"Created video with {frames_written} frames at {actual_fps} FPS")
     print(f"Total duration: {total_frames/actual_fps:.2f} seconds")
     print(f"Video saved to: {output_path}")
-    
+
     return output_path
 
 
-def evaluate_video_chunk_new(model, video_path, transcript="No transcript provided", description="No description provided", 
-                             save_processed_video=None, target_fps=None, retry_limit=5):
+def evaluate_video_chunk_new(
+    model: str,
+    video_path: str,
+    transcript: str = "No transcript provided",
+    description: str = "No description provided",
+    save_processed_video: str = None,
+    target_fps: int = None,
+    retry_limit: int = 5,
+    openrouter_client: OpenRouterClient = None,
+):
     """
     Evaluate a single video chunk using a multimodal model.
 
@@ -137,30 +153,93 @@ def evaluate_video_chunk_new(model, video_path, transcript="No transcript provid
     """
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video file not found: {video_path}")
-    
+
     # Only process video if target_fps is specified
     if target_fps is not None:
-        processed_video_path = reduce_video_framerate(video_path, target_fps=target_fps, output_path=save_processed_video)
+        processed_video_path = reduce_video_framerate(
+            video_path, target_fps=target_fps, output_path=save_processed_video)
         video_to_use = processed_video_path
     else:
         video_to_use = video_path
 
     prompt = _video_eval_new.format(description=description)
-    inputs = _prepare_text_video_inputs(prompt, video_to_use)
+    client = openrouter_client or OpenRouterClient()
+
+    def _sample_frames_as_data_urls(path: str, num_frames: int = 4) -> list[str]:
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            return []
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+        if total_frames <= 0:
+            cap.release()
+            return []
+
+        # Sample evenly spaced frames (skip very first/last).
+        indices = [
+            int(total_frames * (i + 1) / (num_frames + 1))
+            for i in range(num_frames)
+        ]
+
+        frames: list[str] = []
+        for idx in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            ok, buf = cv2.imencode(".jpg", frame)
+            if not ok:
+                continue
+            b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
+            frames.append(f"data:image/jpeg;base64,{b64}")
+        cap.release()
+        return frames
 
     try:
+        last_err: Exception | None = None
         for attempt in range(retry_limit):
             try:
-                response = model(inputs)
-                response_json = extract_json(response)
+                messages = [
+                    build_user_message(
+                        [
+                            {"type": "text", "text": prompt},
+                            local_video_path_to_part(video_to_use),
+                        ]
+                    )
+                ]
+                response = client.chat_completions(
+                    model=model, messages=messages, temperature=0.0)
+                response_json = extract_json(response.text)
                 response_json = convert_score_fields(response_json)
+                response_json["_video_eval_transport"] = "openrouter_video_url"
 
                 return response_json
             except Exception as e:
                 print(f"Attempt {attempt + 1} failed: {e}")
+                last_err = e
                 if attempt + 1 == retry_limit:
-                    print("Reached maximum retry limit. Evaluation failed.")
-                    raise
+                    print(
+                        "Reached maximum retry limit for video_url eval. Falling back to frame-based eval...")
+
+        # Frame-based fallback: send multiple frames as image_url parts to the same judge model.
+        frames = _sample_frames_as_data_urls(video_to_use, num_frames=4)
+        if not frames:
+            raise last_err or RuntimeError(
+                "Video eval failed and no frames could be extracted for fallback.")
+
+        fallback_prompt = (
+            prompt
+            + "\n\nThe following images are sequential frames sampled from a short video chunk. "
+              "Evaluate visual consistency across these frames."
+        )
+        fallback_parts = [{"type": "text", "text": fallback_prompt}
+                          ] + [image_url_part(u) for u in frames]
+        fallback_messages = [build_user_message(fallback_parts)]
+        fallback_resp = client.chat_completions(
+            model=model, messages=fallback_messages, temperature=0.0)
+        fallback_json = extract_json(fallback_resp.text)
+        fallback_json = convert_score_fields(fallback_json)
+        fallback_json["_video_eval_transport"] = "frames_fallback"
+        return fallback_json
     finally:
         # Clean up the temporary processed video if we created one
         if target_fps is not None and save_processed_video is None and os.path.exists(processed_video_path):

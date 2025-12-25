@@ -14,6 +14,10 @@ import uuid # Import uuid for generating trace_id
 from mllm_tools.litellm import LiteLLMWrapper
 from mllm_tools.utils import _prepare_text_inputs # Keep _prepare_text_inputs if still used directly in main
 
+# Model registry (aliases -> OpenRouter ids)
+from src.utils.model_registry import default_registry_path, resolve_model
+from src.config.runtime import load_runtime_config
+
 # Import new modules
 from src.core.video_planner import VideoPlanner
 from src.core.code_generator import CodeGenerator
@@ -28,11 +32,6 @@ from src.core.parse_video import (
 )
 from task_generator import get_banned_reasonings
 from task_generator.prompts_raw import (_code_font_size, _code_disable, _code_limit, _prompt_manim_cheatsheet)
-
-# Load allowed models list from JSON file
-allowed_models_path = os.path.join(os.path.dirname(__file__), 'src', 'utils', 'allowed_models.json')
-with open(allowed_models_path, 'r') as f:
-    allowed_models = json.load(f).get("allowed_models", [])
 
 load_dotenv(override=True)
 
@@ -311,9 +310,15 @@ class VideoGenerator:
 
         # Create tasks for each scene
         tasks = []
-        for i, implementation_plan in enumerate(implementation_plans):
+        for i, item in enumerate(implementation_plans):
+            # Support either a plain list of plans (legacy) or a list of (scene_num, plan) pairs.
+            if isinstance(item, (tuple, list)) and len(item) == 2:
+                scene_num, implementation_plan = item
+            else:
+                scene_num, implementation_plan = i + 1, item
+
             # Try to load scene trace id, or generate new one if it doesn't exist
-            scene_dir = os.path.join(self.output_dir, file_prefix, f"scene{i+1}")
+            scene_dir = os.path.join(self.output_dir, file_prefix, f"scene{scene_num}")
             subplan_dir = os.path.join(scene_dir, "subplans")
             os.makedirs(subplan_dir, exist_ok=True)  # Create directories if they don't exist
             
@@ -326,13 +331,13 @@ class VideoGenerator:
                 with open(scene_trace_id_path, 'w') as f:
                     f.write(scene_trace_id)
 
-            task = self.process_scene(i, scene_outline, implementation_plan, topic, description, max_retries, file_prefix, session_id, scene_trace_id)
+            task = self.process_scene(scene_num, scene_outline, implementation_plan, topic, description, max_retries, file_prefix, session_id, scene_trace_id)
             tasks.append(task)
 
         # Execute all tasks concurrently
         await asyncio.gather(*tasks)
 
-    async def process_scene(self, i: int, scene_outline: str, scene_implementation: str, topic: str, description: str, max_retries: int, file_prefix: str, session_id: str, scene_trace_id: str): # added scene_trace_id
+    async def process_scene(self, scene_num: int, scene_outline: str, scene_implementation: str, topic: str, description: str, max_retries: int, file_prefix: str, session_id: str, scene_trace_id: str): # added scene_trace_id
         """
         Process a single scene using CodeGenerator and VideoRenderer.
 
@@ -347,7 +352,7 @@ class VideoGenerator:
             session_id (str): Session identifier for tracking
             scene_trace_id (str): Trace identifier for this scene
         """
-        curr_scene = i + 1
+        curr_scene = scene_num
         curr_version = 0
         # scene_trace_id = str(uuid.uuid4()) # Remove uuid generation
         rag_queries_cache = {}  # Initialize RAG queries cache
@@ -394,7 +399,8 @@ class VideoGenerator:
                     banned_reasonings=self.banned_reasonings, # Pass banned reasonings
                     scene_trace_id=scene_trace_id,
                     topic=topic,
-                    session_id=session_id
+                    session_id=session_id,
+                    scene_model_name=getattr(self.code_generator.scene_model, "model_name", None)
                 )
                 if error_message is None: # Render success if error_message is None
                     break
@@ -577,8 +583,7 @@ class VideoGenerator:
             # Sort by scene number to ensure correct order
             scene_plans.sort(key=lambda x: x[0])
             # Extract just the plans in the correct order
-            filtered_implementation_plans = [plan for _, plan in scene_plans]
-            await self.render_video_fix_code(topic, description, scene_outline, filtered_implementation_plans,
+            await self.render_video_fix_code(topic, description, scene_outline, scene_plans,
                                            max_retries=max_retries, session_id=session_id)
         
         if not args.only_render:  # Skip video combination in only_render mode
@@ -666,12 +671,19 @@ class VideoGenerator:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Generate Manim videos using AI')
-    parser.add_argument('--model', type=str, choices=allowed_models,
-                      default='gemini/gemini-1.5-pro-002', help='Select the AI model to use')
+    parser.add_argument('--provider', type=str, default=None,
+                      help='Provider routing mode. If unset, uses TEA_PROVIDER from env (default: openrouter).')
+    parser.add_argument('--registry_path', type=str, default=default_registry_path(),
+                      help='Path to model registry JSON (aliases -> OpenRouter ids).')
+    parser.add_argument('--aliases_only', action='store_true',
+                      help='If set, only allow model aliases found in the model registry.')
+    parser.add_argument('--model', type=str,
+                      default='gpt4o_mini',
+                      help='Select the AI model to use (model alias from registry, or a raw model string if not using --aliases_only). Default: gpt4o_mini (fast/cheap/reliable).')
     parser.add_argument('--topic', type=str, default=None, help='Topic to generate videos for')
     parser.add_argument('--context', type=str, default=None, help='Context of the topic')
-    parser.add_argument('--helper_model', type=str, choices=allowed_models,
-                      default=None, help='Select the helper model to use')
+    parser.add_argument('--helper_model', type=str,
+                      default=None, help='Select the helper model to use (alias or raw string). Defaults to --model.')
     parser.add_argument('--only_gen_vid', action='store_true', help='Only generate videos to existing plans')
     parser.add_argument('--only_combine', action='store_true', help='Only combine videos')
     parser.add_argument('--peek_existing_videos', '--peek', action='store_true', help='Peek at existing videos')
@@ -686,8 +698,7 @@ if __name__ == "__main__":
     parser.add_argument('--manim_docs_path', type=str, default=Config.MANIM_DOCS_PATH, help="Path to manim docs") # Use Config
     parser.add_argument('--embedding_model', type=str,
                        default=Config.EMBEDDING_MODEL, # Use Config
-                       choices=["azure/text-embedding-3-large", "vertex_ai/text-embedding-005"],
-                       help='Select the embedding model to use')
+                       help='Select the embedding model to use (e.g. openrouter/openai/text-embedding-3-large, azure/text-embedding-3-large, vertex_ai/text-embedding-005)')
     parser.add_argument('--use_context_learning', action='store_true',
                        help='Use context learning with example Manim code')
     parser.add_argument('--context_learning_path', type=str,
@@ -706,33 +717,51 @@ if __name__ == "__main__":
     parser.add_argument('--scenes', nargs='+', type=int, help='Specific scenes to process (if theorems_path is provided)')
     args = parser.parse_args()
 
+    runtime = load_runtime_config()
+    provider = args.provider or runtime.provider
+
+    allow_raw_models = not args.aliases_only
+    resolved_model, model_spec, model_in_registry = resolve_model(
+        args.model, registry_path=args.registry_path, allow_raw=allow_raw_models
+    )
+    if not model_in_registry:
+        print(f"Warning: model {args.model!r} not found in registry at {args.registry_path}; using as raw model id.")
+
+    helper_model_arg = args.helper_model if args.helper_model else args.model
+    resolved_helper_model, _, helper_in_registry = resolve_model(
+        helper_model_arg, registry_path=args.registry_path, allow_raw=allow_raw_models
+    )
+    if args.helper_model and (not helper_in_registry):
+        print(f"Warning: helper_model {args.helper_model!r} not found in registry; using as raw model id.")
+
     # Initialize planner model using LiteLLM
     if args.verbose:
         verbose = True
     else:
         verbose = False
     planner_model = LiteLLMWrapper(
-        model_name=args.model,
+        model_name=resolved_model,
         temperature=0.7,
         print_cost=True,
         verbose=verbose,
         use_langfuse=args.use_langfuse
     )
     helper_model = LiteLLMWrapper(
-        model_name=args.helper_model if args.helper_model else args.model, # Use helper_model if provided, else planner_model
+        model_name=resolved_helper_model,  # defaults to resolved_model if helper_model not provided
         temperature=0.7,
         print_cost=True,
         verbose=verbose,
         use_langfuse=args.use_langfuse
     )
     scene_model = LiteLLMWrapper( # Initialize scene_model separately
-        model_name=args.model,
+        model_name=resolved_model,
         temperature=0.7,
         print_cost=True,
         verbose=verbose,
         use_langfuse=args.use_langfuse
     )
-    print(f"Planner model: {args.model}, Helper model: {args.helper_model if args.helper_model else args.model}, Scene model: {args.model}") # Print all models
+    print(f"Provider mode: {provider}")
+    print(f"Planner model: {resolved_model}, Helper model: {resolved_helper_model}, Scene model: {resolved_model}")
 
 
     if args.theorems_path:

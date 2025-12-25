@@ -10,7 +10,9 @@ class Config:
     CONTEXT_LEARNING_PATH = "data/context_learning"
     CHROMA_DB_PATH = "data/rag/chroma_db"
     MANIM_DOCS_PATH = "data/rag/manim_docs"
-    EMBEDDING_MODEL = "azure/text-embedding-3-large"
+    # Default to OpenRouter embeddings for a single-key setup.
+    # (OpenRouter model id is the suffix after "openrouter/".)
+    EMBEDDING_MODEL = "openrouter/openai/text-embedding-3-large"
     
     # Kokoro TTS configurations
     KOKORO_MODEL_PATH = os.getenv('KOKORO_MODEL_PATH')

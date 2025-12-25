@@ -1,6 +1,6 @@
 import json
 import os
-from typing import List, Dict
+from typing import List, Dict, Optional
 import uuid
 from langchain.schema import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -16,6 +16,7 @@ from tqdm import tqdm
 from langfuse import Langfuse
 
 from mllm_tools.utils import _prepare_text_inputs
+from mllm_tools.openrouter_client import OpenRouterClient
 from task_generator import get_prompt_detect_plugins
 
 class RAGVectorStore:
@@ -115,8 +116,18 @@ class RAGVectorStore:
         class LiteLLMEmbeddings(Embeddings):
             def __init__(self, embedding_model):
                 self.embedding_model = embedding_model
+                self._openrouter_client: Optional[OpenRouterClient] = None
+                if isinstance(self.embedding_model, str) and self.embedding_model.startswith("openrouter/"):
+                    self._openrouter_client = OpenRouterClient()
 
             def embed_documents(self, texts: list[str]) -> list[list[float]]:
+                # OpenRouter embeddings (single-key setup)
+                if self._openrouter_client is not None:
+                    model_id = self.embedding_model[len("openrouter/"):]
+                    response = self._openrouter_client.embeddings(model=model_id, input=texts)
+                    return [r["embedding"] for r in response["data"]]
+
+                # Existing LiteLLM embedding backends (Azure/Vertex/etc.)
                 litellm.success_callback = []
                 litellm.failure_callback = []
                 response = embedding(
@@ -129,6 +140,11 @@ class RAGVectorStore:
                 return [r["embedding"] for r in response["data"]]
             
             def embed_query(self, text: str) -> list[float]:
+                if self._openrouter_client is not None:
+                    model_id = self.embedding_model[len("openrouter/"):]
+                    response = self._openrouter_client.embeddings(model=model_id, input=[text])
+                    return response["data"][0]["embedding"]
+
                 litellm.success_callback = []
                 litellm.failure_callback = []
                 response = embedding(
@@ -261,6 +277,7 @@ class RAGVectorStore:
         manim_plugin_formatted_results = []
         
         # Create a Langfuse span if enabled
+        span = None
         if self.use_langfuse:
             langfuse = Langfuse()
             span = langfuse.span(
@@ -283,7 +300,8 @@ class RAGVectorStore:
         # Search in core manim docs
         for query in manim_core_queries:
             query_text = query["query"]
-            self.core_vector_store._embedding_function.parent_observation_id = span.id
+            if span is not None:
+                self.core_vector_store._embedding_function.parent_observation_id = span.id
             manim_core_results = self.core_vector_store.similarity_search_with_relevance_scores(
                 query=query_text,
                 k=k,
@@ -301,7 +319,8 @@ class RAGVectorStore:
         for query in manim_plugin_queries:
             plugin_name = query["type"]
             query_text = query["query"]
-            self.plugin_stores[plugin_name]._embedding_function.parent_observation_id = span.id
+            if span is not None:
+                self.plugin_stores[plugin_name]._embedding_function.parent_observation_id = span.id
             if plugin_name in self.plugin_stores:
                 plugin_results = self.plugin_stores[plugin_name].similarity_search_with_relevance_scores(
                     query=query_text,
@@ -339,7 +358,7 @@ class RAGVectorStore:
         print(f"Total tokens for the RAG search: {total_tokens}")
         
         # Update Langfuse with the deduplicated results
-        if self.use_langfuse:
+        if self.use_langfuse and span is not None:
             filtered_results_markdown = json.dumps(manim_core_unique_results + manim_plugin_unique_results, indent=2)
             span.update( # Use span.update, not span.end
                 output=filtered_results_markdown,

@@ -61,7 +61,7 @@ sudo apt-get install libsdl-pango-dev
 mkdir -p models && wget -P models https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files/kokoro-v0_19.onnx && wget -P models https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files/voices.bin
 ```
 
-4. Create `.env` based on `.env.template`, filling in the environmental variables according to the models you choose to use.
+4. Create `.env` based on `env.example`, filling in the environmental variables according to the models you choose to use.
 See [LiteLLM](https://docs.litellm.ai/docs/providers) for reference.
 
 ```shell
@@ -71,6 +71,13 @@ Then open the `.env` file and edit it with whatever text editor you like.
 
 Your `.env` file should look like the following:
 ```shell
+# OpenRouter (recommended default)
+OPENROUTER_API_KEY=""
+OPENROUTER_API_BASE="https://openrouter.ai/api/v1"
+OPENROUTER_SITE_URL=""
+OPENROUTER_APP_NAME="TheoremExplainAgent"
+TEA_PROVIDER="openrouter"
+
 # OpenAI
 OPENAI_API_KEY=""
 
@@ -111,13 +118,18 @@ export PYTHONPATH=$(pwd):$PYTHONPATH
 
 ### Supported Models
 <!--You can customize the allowed models by editing the `src/utils/allowed_models.json` file. This file specifies which `model` and `helper_model` the system is permitted to use.--> 
-The model naming follows the LiteLLM convention. For details on how models should be named, please refer to the [LiteLLM documentation](https://docs.litellm.ai/docs/providers).
+This repo supports **model aliases** via `src/utils/model_registry.json`.
+
+- For OpenRouter-first runs, pass an alias like `gpt4o` / `claude45_opus` / `gemini3_flash_video`, or a raw OpenRouter model id like `openai/gpt-4o`.
+- If you want to disallow raw strings and only accept aliases, pass `--aliases_only`.
+
+For non-OpenRouter backends, the underlying model naming still follows the LiteLLM convention; see the [LiteLLM documentation](https://docs.litellm.ai/docs/providers).
 
 ### Generation (Single topic)
 ```shell
 python generate_video.py \
-      --model "openai/o3-mini" \
-      --helper_model "openai/o3-mini" \
+      --model "gpt4o" \
+      --helper_model "gpt4o" \
       --output_dir "output/your_exp_name" \
       --topic "your_topic" \
       --context "description of your topic, e.g. 'This is a topic about the properties of a triangle'" \
@@ -126,8 +138,8 @@ python generate_video.py \
 Example:
 ```shell
 python generate_video.py \
-      --model "openai/o3-mini" \
-      --helper_model "openai/o3-mini" \
+      --model "gpt4o" \
+      --helper_model "gpt4o" \
       --output_dir "output/my_exp_name" \
       --topic "Big O notation" \
       --context "most common type of asymptotic notation in computer science used to measure worst case complexity" \
@@ -136,8 +148,8 @@ python generate_video.py \
 ### Generation (in batch)
 ```shell
 python generate_video.py \
-      --model "openai/o3-mini" \
-      --helper_model "openai/o3-mini" \
+      --model "gpt4o" \
+      --helper_model "gpt4o" \
       --output_dir "output/my_exp_name" \
       --theorems_path data/thb_easy/math.json \
       --max_scene_concurrency 7 \
@@ -149,15 +161,15 @@ Before using RAG, download the RAG documentation from this [Google Drive link](h
 
 ```shell
 python generate_video.py \
-            --model "openai/o3-mini" \
-            --helper_model "openai/o3-mini" \
+            --model "gpt4o" \
+            --helper_model "gpt4o" \
             --output_dir "output/with_rag/o3-mini/vtutorbench_easy/math" \
             --topic "Big O notation" \
             --context "most common type of asymptotic notation in computer science used to measure worst case complexity" \
             --use_rag \
             --chroma_db_path "data/rag/chroma_db" \
             --manim_docs_path "data/rag/manim_docs" \
-            --embedding_model "vertex_ai/text-embedding-005"
+            --embedding_model "openrouter/openai/text-embedding-3-large"
 ```
 
 We support more options for generation, see below for more details:
@@ -223,7 +235,12 @@ options:
 ```
 
 ## Evaluation
-Note that Gemini and GPT4o is required for evaluation.
+Evaluation is **OpenRouter-first** by default.
+
+- Set `OPENROUTER_API_KEY` in your `.env`.
+- `--model_text` / `--model_image` can be any registry alias or raw OpenRouter model id.
+- `--model_video` should be a **video-capable** OpenRouter model id (e.g. `google/gemini-3-flash-preview`) or the registry alias `gemini3_flash_video`.
+- Video evaluation uses OpenRouter `video_url` inputs and automatically falls back to a **frame-based** consistency judge if a video chunk request fails.
 
 Currently, evaluation requires a video file and a subtitle file (SRT format).
 

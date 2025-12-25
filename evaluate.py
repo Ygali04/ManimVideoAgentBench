@@ -2,23 +2,104 @@ import os
 import json
 import argparse
 import tempfile
-from typing import Dict, List, Union
+from typing import Dict, List, Union, Any
 from datetime import datetime
+import hashlib
+import re
 
 from dotenv import load_dotenv
 from moviepy import VideoFileClip
 
 from mllm_tools.litellm import LiteLLMWrapper
-from mllm_tools.gemini import GeminiWrapper
+from mllm_tools.openrouter_client import OpenRouterClient
 from eval_suite.utils import calculate_geometric_mean
 from eval_suite.text_utils import parse_srt_to_text, fix_transcript, evaluate_text
 from eval_suite.video_utils import evaluate_video_chunk_new
 from eval_suite.image_utils import evaluate_sampled_images
 
+from src.config.runtime import load_runtime_config
+from src.utils.model_registry import default_registry_path, resolve_model
+
 load_dotenv()
 
-with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "src", "utils", "allowed_models.json")) as f:
-    ALLOWED_MODELS = json.load(f)["allowed_models"]
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _hash_prompts() -> Dict[str, Dict[str, str]]:
+    """
+    Hash raw prompt templates so evaluation runs are reproducible and comparable.
+    """
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    targets = {
+        "task_generator/prompts_raw": os.path.join(repo_root, "task_generator", "prompts_raw"),
+        "eval_suite/prompts_raw": os.path.join(repo_root, "eval_suite", "prompts_raw"),
+    }
+    out: Dict[str, Dict[str, str]] = {}
+    for name, root in targets.items():
+        file_hashes: Dict[str, str] = {}
+        if not os.path.isdir(root):
+            out[name] = file_hashes
+            continue
+        for dirpath, _, filenames in os.walk(root):
+            for fn in filenames:
+                path = os.path.join(dirpath, fn)
+                rel = os.path.relpath(path, repo_root)
+                file_hashes[rel] = _sha256_file(path)
+        out[name] = dict(sorted(file_hashes.items()))
+    return out
+
+
+def _compute_success_metadata(theorem_dir: str, video_path: str, transcript_path: str) -> Dict[str, Union[bool, int, List[str], str]]:
+    """
+    Strict success definition (per notes/eval.md) plus partial debugging fields.
+    """
+    has_video = bool(video_path and os.path.exists(video_path))
+    has_transcript = bool(transcript_path and os.path.exists(transcript_path))
+
+    video_playable = False
+    video_duration_s: float = 0.0
+    if has_video:
+        try:
+            with VideoFileClip(video_path) as clip:
+                video_duration_s = float(clip.duration or 0.0)
+            video_playable = video_duration_s > 0.0
+        except Exception:
+            video_playable = False
+
+    scene_dirs = [
+        d for d in os.listdir(theorem_dir)
+        if os.path.isdir(os.path.join(theorem_dir, d)) and re.match(r"^scene\\d+$", d)
+    ]
+    scene_dirs.sort(key=lambda s: int(s.replace("scene", "")))
+
+    missing_succ_markers: List[str] = []
+    for d in scene_dirs:
+        if not os.path.exists(os.path.join(theorem_dir, d, "succ_rendered.txt")):
+            missing_succ_markers.append(d)
+
+    # Strict definition from notes/eval.md
+    strict_success = bool(
+        video_playable
+        and has_transcript
+        and len(scene_dirs) > 0
+        and len(missing_succ_markers) == 0
+    )
+
+    return {
+        "strict_success": strict_success,
+        "has_video": has_video,
+        "video_playable": video_playable,
+        "video_duration_s": video_duration_s,
+        "has_transcript": has_transcript,
+        "scene_dirs": len(scene_dirs),
+        "missing_succ_rendered": missing_succ_markers,
+    }
 
 
 def combine_results(output_folder: str, combined_file: str, results: Dict[str, Dict]) -> None:
@@ -91,7 +172,7 @@ def evaluate_text_file(model, transcript_path, retry_limit):
     return result
 
 
-def evaluate_video_file(model, video_path, transcript_path, description_path, target_fps=None, output_folder=None):
+def evaluate_video_file(model, video_path, transcript_path, description_path, target_fps=None, output_folder=None, openrouter_client: OpenRouterClient = None):
     """
     Evaluate a video file using the provided model.
 
@@ -147,7 +228,8 @@ def evaluate_video_file(model, video_path, transcript_path, description_path, ta
                     transcript_path,
                     description_path,
                     target_fps=target_fps,
-                    save_processed_video=save_path
+                    save_processed_video=save_path,
+                    openrouter_client=openrouter_client
                 )
                 results.append(result)
 
@@ -244,7 +326,8 @@ def merge_dicts(dict1: dict, dict2: dict) -> dict:
 
 def process_theorem(models, file_path: str, eval_type: str, retry_limit: int,
                     target_fps: int = None, use_parent_folder_as_topic: bool = False,
-                    output_folder: str = None) -> tuple[str, dict]:
+                    output_folder: str = None,
+                    run_metadata: Dict[str, Any] = None) -> tuple[str, dict]:
     """
     Process a theorem file or directory for evaluation.
 
@@ -278,7 +361,7 @@ def process_theorem(models, file_path: str, eval_type: str, retry_limit: int,
             else:
                 topic_name = None
             topic_name = process_topic_name(topic_name)
-            return file_name, evaluate_video_file(models['video'], file_path, None, topic_name, target_fps, output_folder)
+            return file_name, evaluate_video_file(models['video'], file_path, None, topic_name, target_fps, output_folder, openrouter_client=models.get('video_client'))
         elif eval_type == "image" and file_ext in ext_map['video']:
             if use_parent_folder_as_topic:
                 topic_name = os.path.basename(os.path.dirname(file_path))
@@ -324,7 +407,7 @@ def process_theorem(models, file_path: str, eval_type: str, retry_limit: int,
             text_result = evaluate_text_file(models['text'], transcript_path, retry_limit)
     if eval_type == "video" or eval_type == "all":
         assert video_path is not None, f"Expected 1 video file, got {len(video_file_candidates)} for {theorem_dir}"
-        video_result = evaluate_video_file(models['video'], video_path, transcript_path, topic_name, target_fps, output_folder)
+        video_result = evaluate_video_file(models['video'], video_path, transcript_path, topic_name, target_fps, output_folder, openrouter_client=models.get('video_client'))
     if eval_type == "image" or eval_type == "all":
         assert video_path is not None, f"Expected 1 video file, got {len(video_file_candidates)} for {theorem_dir}"
         image_result = evaluate_sampled_images(models['image'], video_path, topic_name, num_chunks=10, output_folder=output_folder)
@@ -342,6 +425,14 @@ def process_theorem(models, file_path: str, eval_type: str, retry_limit: int,
     else:
         result = text_result if eval_type == "text" else video_result if eval_type == "video" else image_result if eval_type == "image" else None
 
+    # Attach strict success criteria + run metadata for reproducibility.
+    if result is not None:
+        result.setdefault("_metadata", {})
+        result["_metadata"]["success"] = _compute_success_metadata(theorem_dir, video_path, transcript_path)
+        if run_metadata:
+            # Shallow-merge under a stable key.
+            result["_metadata"]["run"] = run_metadata
+
     file_name = os.path.basename(theorem_dir)
     return file_name, result
 
@@ -354,20 +445,21 @@ def main():
     for text, video, and image content using specified AI models.
     """
     parser = argparse.ArgumentParser(description='Automatic evaluation of theorem explanation videos with LLMs')
-    parser.add_argument('--model_text', type=str, 
-                       choices=ALLOWED_MODELS,
-                       default='azure/gpt-4o',
-                       help='Select the AI model to use for text evaluation')
+    parser.add_argument('--provider', type=str, default=None,
+                       help='Provider routing mode. If unset, uses TEA_PROVIDER from env (default: openrouter).')
+    parser.add_argument('--registry_path', type=str, default=default_registry_path(),
+                       help='Path to model registry JSON (aliases -> OpenRouter ids).')
+    parser.add_argument('--aliases_only', action='store_true',
+                       help='If set, only allow model aliases found in the model registry.')
+    parser.add_argument('--model_text', type=str,
+                       default='gpt4o',
+                       help='Text judge model (alias from registry, or raw model string if not using --aliases_only).')
     parser.add_argument('--model_video', type=str,
-                       choices=['gemini/gemini-1.5-pro-002',
-                                'gemini/gemini-2.0-flash-exp',
-                                'gemini/gemini-2.0-pro-exp-02-05'],
-                       default='gemini/gemini-1.5-pro-002',
-                       help='Select the AI model to use for video evaluation')
+                       default='gemini3_flash_video',
+                       help='Video judge model (alias from registry, or raw model string if not using --aliases_only).')
     parser.add_argument('--model_image', type=str,
-                       choices=ALLOWED_MODELS,
-                       default='azure/gpt-4o',
-                       help='Select the AI model to use for image evaluation')
+                       default='gpt4o',
+                       help='Image judge model (alias from registry, or raw model string if not using --aliases_only).')
     parser.add_argument('--eval_type', type=str, choices=['text', 'video', 'image', 'all'], default='all', help='Type of evaluation to perform')
     parser.add_argument('--file_path', type=str, help='Path to a file or a theorem folder', required=True)
     parser.add_argument('--output_folder', type=str, help='Directory to store the evaluation files', required=True)
@@ -380,24 +472,55 @@ def main():
 
     args = parser.parse_args()
 
+    runtime = load_runtime_config()
+    provider = args.provider or runtime.provider
+
+    allow_raw_models = not args.aliases_only
+    resolved_text_model, _, text_in_registry = resolve_model(
+        args.model_text, registry_path=args.registry_path, allow_raw=allow_raw_models
+    )
+    if not text_in_registry:
+        print(f"Warning: model_text {args.model_text!r} not found in registry at {args.registry_path}; using as raw model id.")
+
+    resolved_video_model, _, video_in_registry = resolve_model(
+        args.model_video, registry_path=args.registry_path, allow_raw=allow_raw_models
+    )
+    if not video_in_registry:
+        print(f"Warning: model_video {args.model_video!r} not found in registry at {args.registry_path}; using as raw model id.")
+
+    resolved_image_model, _, image_in_registry = resolve_model(
+        args.model_image, registry_path=args.registry_path, allow_raw=allow_raw_models
+    )
+    if not image_in_registry:
+        print(f"Warning: model_image {args.model_image!r} not found in registry at {args.registry_path}; using as raw model id.")
+
+    print(f"Provider mode: {provider}")
+    prompt_hashes = _hash_prompts()
+
     # Initialize separate models
     text_model = LiteLLMWrapper(
-        model_name=args.model_text,
-        temperature=0.0,
-    )
-    video_model = GeminiWrapper(
-        model_name=args.model_video,
+        model_name=resolved_text_model,
         temperature=0.0,
     )
     image_model = LiteLLMWrapper(
-        model_name=args.model_image,
+        model_name=resolved_image_model,
         temperature=0.0,
     )
 
     models = {
         'text': text_model,
-        'video': video_model,
+        'video': resolved_video_model,
+        'video_client': OpenRouterClient(),
         'image': image_model
+    }
+    run_metadata = {
+        "provider": provider,
+        "models": {
+            "text": resolved_text_model,
+            "image": resolved_image_model,
+            "video": resolved_video_model,
+        },
+        "prompt_hashes": prompt_hashes,
     }
 
     theorem_dirs = []
@@ -432,7 +555,8 @@ def main():
                 args.retry_limit,
                 args.target_fps,
                 args.use_parent_folder_as_topic,
-                args.output_folder
+                args.output_folder,
+                run_metadata=run_metadata
             )
 
             if result is not None:
@@ -448,7 +572,8 @@ def main():
             args.retry_limit,
             args.target_fps,
             args.use_parent_folder_as_topic,
-            args.output_folder
+            args.output_folder,
+            run_metadata=run_metadata
         )
         
         if result is not None:
